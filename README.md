@@ -1,15 +1,19 @@
 # pixtreme-transport-ffmpeg
 
-Read video files with FFmpeg software decoders and receive independently owned
-GPU `pixtreme.PixelBuffer` values. Decoding runs on the CPU, including for codecs
-that NVDEC cannot decode, such as ProRes. The reader preserves the decoder's
-sample layout, bit depth, colour declarations, display order and exact
-presentation times without colour conversion.
+Demux and mux containers, decode and encode video and audio with FFmpeg software
+codecs, and read video files as independently owned GPU `pixtreme.PixelBuffer`
+values. The demuxer, decoders, encoders and muxer can be used separately, with
+file paths, byte callbacks or caller-supplied packets as appropriate. The video
+reader combines demux and decode, preserving sample layout, bit depth, colour
+declarations, display order and exact presentation times without colour conversion.
 
-The same reader is available through Python, a C ABI and a header-only C++
-wrapper. A CUDA-capable NVIDIA GPU and a driver compatible with pixtreme are
-required to receive pictures; opening a file and inspecting its description do
-not initialise the GPU.
+All operations are available through Python, a C ABI and a header-only C++
+wrapper. Codecs run on the CPU, including for codecs that NVDEC cannot decode,
+such as ProRes. Video output uses GPU PixelBuffers and video encoding copies
+input PixelBuffers back to the CPU. These transfers require a CUDA-capable
+NVIDIA GPU and a driver compatible with pixtreme. Demux, mux, audio operations
+and capability queries do not initialise a GPU; opening a reader or video
+decoder and inspecting metadata also leave the GPU uninitialised.
 
 ## Installation
 
@@ -19,7 +23,7 @@ Install the Python package from [PyPI](https://pypi.org/project/pixtreme-transpo
 python -m pip install pixtreme-transport-ffmpeg
 ```
 
-The package requires CPython 3.12 or newer and `pixtreme>=2.28.1`. Wheels use the
+The package requires CPython 3.12 or newer and `pixtreme>=2.29.0`. Wheels use the
 CPython stable ABI (`abi3`). Linux x86_64 wheels require glibc 2.28 or newer.
 Check the assets in the [Release for your version](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases)
 for available platforms. Windows x86_64 artifacts are added only for versions
@@ -28,14 +32,14 @@ that have passed native Windows build and runtime checks.
 For C and C++, obtain the SDK archive from the same Release. The SDK contains
 shared libraries, public headers and a CMake package. A Conan 2 recipe named
 `pixtreme-transport-ffmpeg`, which downloads this SDK, is distributed separately
-to the publisher's organisation projects. The pixtreme SDK, version 2.28.1 or newer, is also required. When installing
+to the publisher's organisation projects. The pixtreme SDK, version 2.29.0 or newer, is also required. When installing
 archives manually, make both SDKs discoverable to CMake and their shared
 libraries discoverable to the operating system's library loader.
 
 FFmpeg shared libraries are included in the wheel and SDK. Installing a separate
-FFmpeg executable is unnecessary for using the reader.
+FFmpeg executable is unnecessary for using the library.
 
-## Python
+## Python reader
 
 ```python
 from fractions import Fraction
@@ -71,6 +75,215 @@ The context manager closes the reader even if the body raises an exception.
 `close()` can be repeated. Returned PixelBuffers stay valid after later reads
 and after closing the reader. Reads, seeks and metadata queries on a closed
 reader fail. Calls on one reader must not overlap.
+
+## Demux, decode, encode and mux
+
+These operations are independent of the reader and do not require
+`pixtreme.transport` core. Media operations run synchronously on the calling
+thread, without an application packet queue or worker thread. Calls on one
+instance must not overlap, except that a demuxer's or muxer's `interrupt()` may
+run from another thread. Finish those calls before destroying the instance.
+A stop request is terminal for that instance.
+
+### Packets, streams and demux
+
+`Demuxer(path)` or `Demuxer(read, seek=seek)` probes a container and exposes
+`streams`, a list of owned `StreamDescription` snapshots. `read()` returns an
+owned `Packet`, or `None` at EOF. Demux does not require a supported decoder.
+The packet carries encoded `payload` bytes, `stream_index`, flags, side data
+and optional integer `pts`, `dts` and `duration`; absent timestamps are `None`.
+The original `time_base_numerator` and `time_base_denominator` integers retain
+unknown clock values. `time_base` provides a `Fraction` for valid clocks.
+Stream snapshots
+include `codec`, `kind`, codec `configuration`, time base, video/audio parameters
+and `packet_format` (`length_prefixed`, `annex_b`, `native` or `unknown`). Demux
+preserves these values without filling timestamps or converting bitstreams.
+
+For external encoded input, construct `Packet(payload, ...)` and
+`StreamDescription(codec, kind=..., ...)` with the same information instead of
+using demux. Their constructors copy configuration, payload and side data.
+Packets and descriptions remain valid after later reads, seeks and closing the
+demuxer. Python byte properties return owned `bytes`; C++ `info()` and C
+`*_get_info` pointers borrow from their packet or description until its last
+owner is destroyed.
+
+A Python read callback accepts a maximum byte count and returns at most that
+many `bytes`; `b""` means permanent EOF. An optional seek callback takes
+`(offset, whence)` and returns the absolute byte position. Whence is 0, 1 or 2,
+or `ffmpeg.IO_SIZE` to query size without moving (return -1 if unknown).
+`demux.seek(stream_index, timestamp, backward=True)` uses that stream's integer
+ticks and seeks to a preceding keyframe by default. Without a path or seek
+callback, seeking raises `NOT_SEEKABLE`; the demuxer determines the exact landing
+packet. Flush a separate decoder after seeking before submitting new packets.
+
+Python callback exceptions become `ReaderError` with `IO_FAILED`;
+`InterruptedError` instead requests a stop and reports `INTERRUPTED`, including
+during probing. Callbacks are retained until the demuxer or muxer is destroyed;
+keep captured resources alive through destruction. No callback runs after close.
+`interrupt()` cannot preempt a blocked callback: the caller must wake it and
+make it return on stop. C callbacks return byte counts, 0 for read EOF,
+`PIXTREME_TRANSPORT_FFMPEG_IO_INTERRUPTED` for stop, or another negative value for
+failure, and must not throw. Keep their context valid through destruction.
+C++ callables use the same return values; exceptions become `IO_FAILED`.
+
+### Video and audio decode
+
+`VideoDecoder(stream, device=0)` accepts packets for the configured stream index
+and the same unreduced time-base integers. `receive()` returns a
+`DecodedPicture` with owned GPU `pixels`, the decoder's `codec`, optional integer
+`pts`/`duration` and the original time base. Unlike the reader's picture times,
+these are stream ticks and can remain unknown. Software decoding runs on the
+CPU; only receiving a picture transfers samples to the GPU. The transfer
+completes before return, and pixels survive decoder reuse, flush and close.
+
+`AudioDecoder(stream)` accepts the same packet type and returns `Audio` values:
+`pcm` is owned interleaved 48000 Hz stereo signed 16-bit little-endian bytes,
+and `presentation_time` is the first sample's position in exact `Fraction`
+seconds. Audio decoding requires a positive stream time base and uses no GPU.
+Both decoder constructors copy the stream description; `send()` borrows its
+packet only for the call. Empty packet payloads are rejected; use `drain()` for
+end of input.
+
+For example, demux a file and decode its first video stream. This requires a
+GPU when pictures are received:
+
+```python
+from pixtreme.transport import ffmpeg
+
+
+def receive_available(decoder):
+    while True:
+        output = decoder.receive()
+        if output in (ffmpeg.DecodeStatus.AGAIN, ffmpeg.DecodeStatus.END):
+            return output
+        print(output.codec, output.pts, output.time_base, output.pixels.format)
+
+
+with ffmpeg.Demuxer("clip.mov") as demux:
+    stream = next(s for s in demux.streams if s.kind == "video")
+    with ffmpeg.VideoDecoder(stream, device=0) as decoder:
+        while (packet := demux.read()) is not None:
+            if packet.stream_index != stream.index:
+                continue
+            while not decoder.send(packet):
+                receive_available(decoder)
+            receive_available(decoder)
+        while not decoder.drain():
+            receive_available(decoder)
+        assert receive_available(decoder) == ffmpeg.DecodeStatus.END
+```
+
+### Video and audio encode
+
+`VideoEncoder(name, time_base=Fraction(...), format=..., width=..., height=...,
+...)` takes an exact pixtreme PixelBuffer description, including bit depth,
+alignment and colour declarations when specified. `send(pixels, pts)` requires
+matching layout, dimensions and colour; `pts` is an integer in the configured
+time base. The GPU-to-CPU copy finishes before `send()` returns, even when it
+returns `False`, so input storage is reusable. Encoding performs no colour or
+layout conversion. `frame_rate=Fraction(...)` is a separate optional declaration,
+not an inference from the timestamp clock.
+
+`AudioEncoder("libopus", time_base=Fraction(1, 48000))` accepts the same PCM
+format that `AudioDecoder` returns. `send(pcm, presentation_time)` takes exact
+`Fraction` or integer seconds for the first sample and copies accepted bytes.
+Times round to the nearest sample, with ties away from zero; accepted chunks
+must be contiguous, without gaps or overlaps. Audio encoding uses no GPU and
+requires the 1/48000-second packet clock; rescaling belongs to mux or the caller.
+
+Both encoders return owned `Packet` values from `receive()` and owned snapshots
+from `stream_description()`, independent of encoder lifetime. Preserve packet
+side data, including codec configuration updates and audio skip/discard samples.
+Take a fresh stream snapshot after drain when final padding information is
+needed. Input options are `options=[("key", "value"), ...]` FFmpeg AVOptions;
+unknown or unused keys fail. Codec threads default to one; the `threads` option
+changes that count. Explicit encoder names take precedence over codec names:
+`libopenh264` selects H.264, `libopus` selects Opus and `libaom-av1` selects AV1.
+In particular, `opus` names FFmpeg's experimental native encoder. An unsupported
+encoder or setting fails without selecting another implementation.
+
+### Codec flow control and drain
+
+Decoder and encoder `send()` and `drain()` return `True` when accepted, or
+`False` when output must be received before retrying the unchanged input.
+`receive()` returns a value, `DecodeStatus.AGAIN` / `EncodeStatus.AGAIN` when
+more input is needed, or `END` from the corresponding enum after drain has
+exhausted the codec and any resampler. One input can yield zero, one or several
+outputs. At EOF, retry `drain()` as needed and receive through `END` before
+closing; an empty packet or PCM chunk is not a drain request.
+
+Accepted drain is idempotent and rejects further input. Decoder `flush()`
+discards buffered output and allows input again; an encoder must be recreated
+to restart. `close()` is idempotent and releases resources; context managers
+and C++ destructors close handles but do not substitute for explicit drain.
+
+### Mux
+
+`Muxer(path, format="mp4")` or `Muxer(write, format="matroska", seek=seek)`
+accepts encoded stream descriptions and packets from demux, an encoder or an
+external source. A path extension can infer the format; a write callback needs
+an explicit FFmpeg muxer name. Mux uses no GPU. Call operations in this order:
+
+1. `add_stream(description)` copies the description and returns its output
+   stream index, independent of the input index. The time base must be positive.
+2. `write_header()` fixes the output stream time bases.
+3. `write_packet(output_index, packet)` borrows the packet for the call, without
+   consuming or modifying it. It rescales PTS/DTS/duration to the output clock.
+   The caller interleaves streams and supplies monotonic DTS as the format
+   requires; missing timestamps are not filled.
+4. `write_trailer()` finalises the container, then `close()` closes the output.
+
+A Python write callback takes `bytes` and returns the number written. Short
+writes are retried; zero and invalid counts fail with `IO_FAILED`.
+Its seek and stop contracts match demux callbacks. Nonseekable destinations
+require a container that supports them; ordinary MP4 output requires seek.
+Header, packet and trailer failures report `HEADER_FAILED`, `PACKET_FAILED`
+and `TRAILER_FAILED`; callback failures and stops retain `IO_FAILED` and
+`INTERRUPTED`, with the stage in the message. A write failure is terminal.
+Close/destruction abandons unfinished output without writing a trailer;
+explicit close after a successful trailer reports path close failures.
+
+Mux uses the container's built-in framing without adding a bitstream filter.
+For `libopenh264` output to MP4 or Matroska, set
+`options=[("flags", "+global_header")]` so the description supplies SPS/PPS.
+For MPEG-TS, leave that flag unset so packets carry in-band SPS/PPS.
+Length-prefixed H.264/HEVC packets cannot be written directly to MPEG-TS or their
+raw Annex B formats. Keep audio padding side data, but account for container
+limits: AAC in MPEG-TS has no skip/discard metadata, and MP4 edit offsets may
+round to the movie clock.
+
+### Errors and C/C++ entry points
+
+Python and C++ use `ReaderError` for library failures, including the operations
+above, with `reason`, message and a path for path-based operations (empty for
+callbacks and standalone codecs). Python argument conversion can also raise
+`TypeError`, `ValueError` or `OverflowError`. C returns status codes and owned
+errors as shown below; codec `AGAIN` and `END` are successful flow-control
+statuses, not errors.
+
+Use the same SDK and CMake targets as the reader examples below. C++ names are
+in `pixtreme::transport::ffmpeg`. Header names in this table are relative to
+`pixtreme/ffmpeg/`; C headers add `c/` and use `.h` instead of `.hpp`.
+Every C function listed has the `pixtreme_transport_ffmpeg_` prefix; `*` in a
+codec function name stands for `video` or `audio`.
+
+| Operation | C++ header and names | Main C functions (prefix omitted) |
+|---|---|---|
+| Demux and encoded values | `demuxer.hpp`: `Demuxer`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
+| Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
+| Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info` |
+| Mux and muxer registry | `muxer.hpp`: `Muxer`, `muxers()` | `muxer_create`, `muxer_create_io`, `muxer_add_stream`, `muxer_write_header`, `muxer_write_packet`, `muxer_write_trailer`, `muxer_count`, `muxer_get_info` |
+| Reader and errors | `reader.hpp`: `Reader`; `error.hpp`: `ReaderError`, `ErrorReason` | `reader_open`, `reader_read`, `reader_seek`, `reader_close`, `error_reason`, `error_path`, `error_message`, `error_release` |
+
+C++ decoder `receive()` returns `std::variant<DecodedPicture, DecodeStatus>` or
+`std::variant<Audio, DecodeStatus>`, and encoders return
+`std::variant<Packet, EncodeStatus>`. The status members are `again` and `end`.
+Operation handles are movable and close on destruction. Packet and stream
+copies share ownership. C uses opaque owned handles with `*_destroy` functions;
+release a returned PixelBuffer with pixtreme's destroy function. C audio bytes
+borrow from the owned audio handle until `audio_destroy`. Registry strings and
+format arrays borrow for the library lifetime, while C++ and Python registry
+queries return owned copies. No FFmpeg header or FFmpeg object is needed.
 
 ## C++
 
@@ -176,7 +389,7 @@ add_executable(reader_cpp reader.cpp)
 target_link_libraries(reader_cpp PRIVATE pixtreme::transport_ffmpeg)
 ```
 
-## Timing, colour and ownership
+## Reader timing, colour and ownership
 
 Pictures arrive in display order, including when decoding reorders B pictures.
 Presentation times retain the container's timeline: a first picture at five
@@ -204,6 +417,19 @@ rules when processing those buffers on other GPU streams.
 
 ## Codecs and pixel formats
 
+`decoders()`, `encoders()` and `muxers()` report the actual linked registry in
+Python and C++. Decoder/encoder entries carry the implementation name, codec,
+media kind and declared pixel/sample formats; an empty format list means
+unspecified. Muxer entries carry `name`, `long_name` and the comma-separated
+`extensions` string. C exposes the corresponding `decoder_count` /
+`decoder_get_info`, `encoder_count` / `encoder_get_info` and `muxer_count` /
+`muxer_get_info` functions with the `pixtreme_transport_ffmpeg_` prefix.
+Registry names can repeat: `matroska` has video and audio entries with different
+long names and extensions. The queries preserve both entries.
+These queries do not initialize a GPU. Opening and supplying input validate
+the concrete configuration; registered muxers that manage their own files
+cannot use the single byte output API.
+
 The bundled FFmpeg enables software video decoders that do not require GPL or
 nonfree components. The reader accepts their output whenever it maps directly
 to pixtreme, regardless of whether NVDEC also supports the codec. The following
@@ -230,26 +456,46 @@ precision. The distribution's `FFmpeg-configuration.json` lists its actual
 enabled video decoders; that list alone does not establish that a decoded pixel
 format is representable.
 
-Unsupported inputs produce a path and reason instead of an implicit conversion:
+The reader rejects unsupported inputs with a path and reason:
 
 - Interlaced pictures and formats that cannot map directly to PixelBuffer.
-  With pixtreme 2.28.1, examples include 9-bit planar samples, 10-bit GBR/gray,
+  With pixtreme 2.29.0, examples include 9-bit planar samples, 10-bit GBR/gray,
   4:1:1/4:4:0, RGB24/RGB48, paletted, floating-point and big-endian samples.
 - Colour declarations without equivalent pixtreme tokens, including limited
   range or a YCbCr matrix on RGB pictures.
 - Inputs without presentation timestamps, files without video, unavailable
   decoders, unreadable files, and corrupt packets or failed decoding.
 
-ProRes RAW, deinterlacing, audio, subtitles, timecode-track extraction and
-encoding are outside this reader's API.
+The reader returns video pictures only. Use the separate library operations
+above for audio decoding, video/audio encoding and container demux/mux. ProRes
+RAW, deinterlacing, subtitle rendering and timecode-track extraction are not
+provided; demux can still expose packets and descriptions for non-video streams.
 
 ## FFmpeg and licenses
 
-The reader is provided under the [MIT license](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/blob/main/LICENSE). Wheels and SDKs bundle
+The library is provided under the [MIT license](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/blob/main/LICENSE). Wheels and SDKs bundle
 FFmpeg shared libraries in an LGPL configuration with GPL and nonfree components
 disabled. FFmpeg's [LGPL 2.1 or later license](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/blob/main/licenses/FFmpeg-LGPL-2.1.txt) and
 the [FFmpeg notice](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/blob/main/licenses/FFmpeg-NOTICE.txt) accompany this distribution.
-Third-party notices also cover dav1d, zlib, liblzma, bzip2 and nanobind.
+Third-party notices also cover dav1d, zlib, liblzma, bzip2, OpenH264, libopus, libaom (including PATENTS) and nanobind.
+
+The external encoder libraries are built from source and statically linked
+into FFmpeg:
+
+| Encoder library | FFmpeg encoder name | Copyright license |
+|---|---|---|
+| OpenH264 | `libopenh264` (H.264) | BSD-2-Clause |
+| libopus | `libopus` (Opus) | BSD-3-Clause |
+| libaom | `libaom-av1` (AV1) | BSD-2-Clause |
+
+Cisco's patent-fee coverage for its separately downloaded OpenH264 binary is
+not assumed for this source build; see the [Cisco binary terms](https://www.openh264.org/BINARY_LICENSE.txt).
+libaom's separate Alliance for Open Media patent terms accompany the
+distribution as `libaom-av1/PATENTS`, alongside its `LICENSE`; the
+[upstream patent license](https://aomedia.googlesource.com/aom/+/refs/tags/v3.6.1/PATENTS)
+sets out its conditions. Opus copyright and patent terms are described on the
+[Opus license page](https://opus-codec.org/license/). These notices do not determine
+patent fees or licensing requirements for a particular use.
 
 For the exact FFmpeg version, configuration, applied changes and build method,
 consult `FFmpeg-NOTICE.txt`, `FFmpeg-configuration.json`, `FFmpeg-changes.diff`

@@ -8,3 +8,14 @@ build instructions, applied changes and configuration for its FFmpeg libraries.
 Its FFmpeg-NOTICE.txt identifies the FFmpeg version, corresponding patched source
 archive and source SHA256. The source archive is provided in the same release:
 https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases
+
+This distribution builds OpenH264 from source and statically links it into FFmpeg.
+Cisco's patent-fee coverage for its separately distributed OpenH264 binary is
+not assumed for this source build. See https://www.openh264.org/BINARY_LICENSE.txt
+for the terms specific to Cisco's binary. No determination of patent fees or
+patent licensing requirements for a particular use is made by this notice.
+
+This distribution builds libaom from source and statically links it into FFmpeg
+for AV1 encoding. Its BSD-2-Clause LICENSE and separate Alliance for Open Media
+patent license terms in PATENTS accompany the wheel, SDK and corresponding source.
+See libaom-av1/LICENSE and libaom-av1/PATENTS in the distribution licenses.
