@@ -1,0 +1,10 @@
+This software uses shared libraries from FFmpeg under LGPL version 2.1 or later.
+FFmpeg is copyright its respective contributors; see https://ffmpeg.org/ and FFmpeg-LGPL-2.1.txt.
+The pixtreme reader's MIT license does not claim ownership of FFmpeg.
+
+Each wheel and SDK includes FFmpeg-LICENSE.md, FFmpeg-BUILD.txt,
+FFmpeg-changes.diff and FFmpeg-configuration.json with the license information,
+build instructions, applied changes and configuration for its FFmpeg libraries.
+Its FFmpeg-NOTICE.txt identifies the FFmpeg version, corresponding patched source
+archive and source SHA256. The source archive is provided in the same release:
+https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases
