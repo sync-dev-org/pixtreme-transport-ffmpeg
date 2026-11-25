@@ -194,6 +194,23 @@ with ffmpeg.Demuxer("clip.mov") as demux:
 
 ### Video and audio encode
 
+`default_encoder(kind)` returns `"libopenh264"` for `"video"` and `"aac"` for
+`"audio"`. Unknown kinds raise `ReaderError` with `INVALID_ARGUMENT`.
+`default_pixel_format(codec)` returns the pixtreme format token and bit depth
+`("yuv420p", 8)` for `"h264"` and `"hevc"`. Other codecs raise
+`UNSUPPORTED_PIXEL_FORMAT`: the caller must choose their pixel format explicitly.
+Use codec names from `EncoderInfo.codec` or `StreamDescription.codec`, rather
+than encoder implementation names, for this query. These queries define the
+defaults independently of the muxer and do not open an encoder or initialize a
+GPU. Creating an encoder with the returned name checks availability; a missing
+encoder fails without selecting another implementation.
+
+The caller converts pixels to the returned target with pixtreme's public
+conversion API, such as `pixtreme.io.to_pixel_buffer(frame, format=format,
+bit_depth=depth)` or `pixtreme.io.repack_pixel_buffer(pixels, format=format,
+bit_depth=depth)`. Pass that format and depth explicitly to `VideoEncoder`.
+The encoder takes an explicit name and performs no pixel conversion.
+
 `VideoEncoder(name, time_base=Fraction(...), format=..., width=..., height=...,
 ...)` takes an exact pixtreme PixelBuffer description, including bit depth,
 alignment and colour declarations when specified. `send(pixels, pts)` requires
@@ -214,9 +231,14 @@ Both encoders return owned `Packet` values from `receive()` and owned snapshots
 from `stream_description()`, independent of encoder lifetime. Preserve packet
 side data, including codec configuration updates and audio skip/discard samples.
 Take a fresh stream snapshot after drain when final padding information is
-needed. Input options are `options=[("key", "value"), ...]` FFmpeg AVOptions;
-unknown or unused keys fail. Codec threads default to one; the `threads` option
-changes that count. Explicit encoder names take precedence over codec names:
+needed. Input options are `options=[("key", "value"), ...]` FFmpeg AVOptions.
+An option whose value FFmpeg cannot parse, or a key the encoder does not consume,
+raises `ReaderError` with `UNSUPPORTED_ENCODER_SETTING`. Its message identifies
+the option name and reason; neither the message nor other error fields include
+the option value. The library silences its bundled FFmpeg's logs for reader,
+demux, decode, encode, mux and capability queries, with no public log controls.
+Codec threads default to one; the `threads` option changes that count. Explicit
+encoder names take precedence over codec names:
 `libopenh264` selects H.264, `libopus` selects Opus and `libaom-av1` selects AV1.
 In particular, `opus` names FFmpeg's experimental native encoder. An unsupported
 encoder or setting fails without selecting another implementation.
@@ -290,7 +312,7 @@ codec function name stands for `video` or `audio`.
 |---|---|---|
 | Demux and encoded values | `demuxer.hpp`: `Demuxer`, `DemuxerConfig`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_open_with_config`, `demuxer_open_io_with_config`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
 | Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
-| Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info` |
+| Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()`, `default_encoder(kind)`, `default_pixel_format(codec)` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info`, `default_encoder`, `default_pixel_format` |
 | Mux and muxer registry | `muxer.hpp`: `Muxer`, `muxers()` | `muxer_create`, `muxer_create_io`, `muxer_add_stream`, `muxer_write_header`, `muxer_write_packet`, `muxer_write_trailer`, `muxer_count`, `muxer_get_info` |
 | Reader and errors | `reader.hpp`: `Reader`; `error.hpp`: `ReaderError`, `ErrorReason` | `reader_open`, `reader_read`, `reader_seek`, `reader_close`, `error_reason`, `error_path`, `error_message`, `error_release` |
 
