@@ -100,6 +100,23 @@ and `packet_format` (`length_prefixed`, `annex_b`, `native` or `unknown`). Demux
 preserves these values without filling timestamps. By default, it returns the
 original packet bytes and configuration.
 
+Stream descriptions also expose `container_color_range`,
+`container_color_primaries`, `container_color_transfer`, `container_color_space`
+and `container_chroma_location` in C, C++ `info()` and Python. These are the
+declarations read from MOV/MP4 `colr` or Matroska Colour headers before FFmpeg
+probes the stream. Missing declarations and other containers return FFmpeg's
+unspecified codes: 2 for primaries, transfer and space; 0 for range and chroma
+location. The original `color_*` and `chroma_location` fields keep their probed
+values.
+
+Reader and video decoder copy each colour field reported by the decoder to the
+`PixelBuffer`. For fields the decoder leaves unspecified, a demuxed description
+supplies its container declaration first, then its original probed value.
+Container colours are not passed to the decoder. For caller-created
+descriptions, pass colours only in the original fields; the container fields
+are outputs and remain unspecified. The C creation function also accepts the
+original record size through `side_data_count`.
+
 Pass `annex_b=True` to either Python constructor to convert every length-prefixed
 H.264/HEVC stream with FFmpeg's `h264_mp4toannexb` / `hevc_mp4toannexb` filter.
 Each returned packet still represents one access unit and retains its stream
@@ -152,8 +169,64 @@ and the same unreduced time-base integers. `receive()` returns a
 `DecodedPicture` with owned GPU `pixels`, the decoder's `codec`, optional integer
 `pts`/`duration` and the original time base. Unlike the reader's picture times,
 these are stream ticks and can remain unknown. Software decoding runs on the
-CPU; only receiving a picture transfers samples to the GPU. The transfer
-completes before return, and pixels survive decoder reuse, flush and close.
+CPU; `receive()` transfers samples to the GPU. The transfer completes before
+return, and pixels survive decoder reuse, flush and close.
+
+`receive_info()` consumes the next picture without initializing a GPU or checking
+whether its pixel format, interlace or colour can be represented by `PixelBuffer`.
+It returns the same `DecodedPicture` type with `pixels=None`. Both receive
+operations consume the same display-order sequence: alternating them never
+returns a picture twice. `receive()` always supplies a `PixelBuffer`.
+
+Both operations return these optional picture-report fields (Python uses `None`,
+C++ uses `std::optional`, and C has a separate `<name>_known` bit for each value):
+
+| Fields | Meaning |
+|---|---|
+| `picture_type` | FFmpeg picture type: I=1, P=2, B=3, S=4, SI=5, SP=6, BI=7; NONE=0 is unknown |
+| `key_frame`, `interlaced`, `top_field_first` | The decoder's picture flags, as booleans |
+| `repeat_pict` | Additional fields repeated for display |
+| `coded_width`, `coded_height` | This picture's dimensions before cropping |
+| `crop_top`, `crop_bottom`, `crop_left`, `crop_right` | Crop on each edge, in pixels; GPU pictures retain the cropped dimensions and samples |
+| `color_range`, `color_primaries`, `color_transfer`, `color_space`, `chroma_location` | FFmpeg colour codes from the decoded picture, without container fallback; unspecified codes are unknown |
+| `packet_index` | The originating packet's zero-based decode-order number |
+| `pts`, `duration` | The originating packet's optional ticks, in the existing time base fields |
+
+These values are the decoder's report, which can differ from the bitstream's
+declarations. Decoder defaults can appear in the colour fields. In particular,
+HEVC interlace flags can remain set on progressive pictures after an earlier
+field stream. This report does not provide HEVC syntax values or determine
+interlace from bitstream syntax. Each value belongs to that picture; values from
+a later decoder context or an earlier picture are never copied into the report.
+Container fallback applies only to the GPU `PixelBuffer` colour declarations.
+
+`packet_index` starts at zero when the decoder is created. A `send()` returning
+success or raising `DECODE_FAILED` consumes one number. `AGAIN` (Python `False`)
+consumes none; receive output and retry the same packet. `INVALID_ARGUMENT` and
+`INVALID_STATE`, drain and flush consume none, and flush does not reset the
+counter. PTS is never used to match packets to pictures: it can be missing or
+repeated. If several packets produce one picture, FFmpeg associates the first
+packet. If FFmpeg supplies no association, `packet_index` is unknown.
+
+Video decoder errors permit the following handling on the same handle:
+
+| Result or reason | Handling |
+|---|---|
+| `AGAIN`, `END` | Existing flow-control rules; handle state is unchanged |
+| `INVALID_ARGUMENT`, `INVALID_STATE` | Correct the call and continue; handle state is unchanged |
+| `INTERLACED`, `UNSUPPORTED_PIXEL_FORMAT`, `UNSUPPORTED_COLOUR` | Only that picture is consumed; receive subsequent pictures |
+| `DECODE_FAILED` | The library leaves the handle open and accepts subsequent operations under the normal send/receive/drain/flush/close rules; do not resend the failed packet |
+| `OUT_OF_MEMORY`, `GPU_FAILED`, any other reason | Recreate the decoder; subsequent behavior is not promised |
+
+After `DECODE_FAILED`, the caller chooses whether to continue, flush and restart
+from a key packet, or recreate the decoder. The library does not automatically
+flush or resend input. Following damaged or missing HEVC/H.264 packets, correct
+output is promised only from a subsequent undamaged HEVC IRAP (including IDR/CRA)
+or H.264 IDR with the necessary parameter sets, followed by undamaged input.
+Other codecs and causes have no recovery guarantee. Decoders can conceal damage
+without an error, so absence of an error does not prove correct samples.
+Drain and receive pending pictures before flush to keep them: flush discards
+pending output. Begin with a key packet after construction or flush.
 
 `AudioDecoder(stream)` accepts the same packet type and returns `Audio` values:
 `pcm` is owned interleaved 48000 Hz stereo signed 16-bit little-endian bytes,
@@ -311,12 +384,13 @@ codec function name stands for `video` or `audio`.
 | Operation | C++ header and names | Main C functions (prefix omitted) |
 |---|---|---|
 | Demux and encoded values | `demuxer.hpp`: `Demuxer`, `DemuxerConfig`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_open_with_config`, `demuxer_open_io_with_config`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
-| Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
+| Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `video_decoder_receive_info`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
 | Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()`, `default_encoder(kind)`, `default_pixel_format(codec)` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info`, `default_encoder`, `default_pixel_format` |
 | Mux and muxer registry | `muxer.hpp`: `Muxer`, `muxers()` | `muxer_create`, `muxer_create_io`, `muxer_add_stream`, `muxer_write_header`, `muxer_write_packet`, `muxer_write_trailer`, `muxer_count`, `muxer_get_info` |
 | Reader and errors | `reader.hpp`: `Reader`; `error.hpp`: `ReaderError`, `ErrorReason` | `reader_open`, `reader_read`, `reader_seek`, `reader_close`, `error_reason`, `error_path`, `error_message`, `error_release` |
 
-C++ decoder `receive()` returns `std::variant<DecodedPicture, DecodeStatus>` or
+C++ video decoder `receive()` / `receive_info()` return
+`std::variant<DecodedPicture, DecodeStatus>`; audio decoder `receive()` returns
 `std::variant<Audio, DecodeStatus>`, and encoders return
 `std::variant<Packet, EncodeStatus>`. The status members are `again` and `end`.
 Operation handles are movable and close on destruction. Packet and stream
