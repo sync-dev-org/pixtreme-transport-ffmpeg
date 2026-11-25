@@ -195,10 +195,38 @@ C++ uses `std::optional`, and C has a separate `<name>_known` bit for each value
 These values are the decoder's report, which can differ from the bitstream's
 declarations. Decoder defaults can appear in the colour fields. In particular,
 HEVC interlace flags can remain set on progressive pictures after an earlier
-field stream. This report does not provide HEVC syntax values or determine
-interlace from bitstream syntax. Each value belongs to that picture; values from
+field stream. The `interlaced` and `top_field_first` fields preserve that decoder
+report. Each value belongs to that picture; values from
 a later decoder context or an earlier picture are never copied into the report.
 Container fallback applies only to the GPU `PixelBuffer` colour declarations.
+
+HEVC pictures additionally expose the originating access unit's bitstream
+syntax, with the same definitions as pixtreme-transport-nvdec 0.14.0:
+
+| Field | Bitstream declaration |
+|---|---|
+| `nal_unit_type` | The picture's slice segment NAL unit type |
+| `general_profile_idc`, `general_profile_compatibility_flags` | The referenced SPS profile; compatibility flag j occupies bit j |
+| `vui_timing` | The unmodified `(num_units_in_tick, time_scale)` integers, when VUI timing is present |
+| `field_seq_flag` | The referenced SPS VUI flag; false when that SPS has no VUI |
+| `pic_struct` | Present only when this picture's timing SEI signals it |
+| `vui_colour_primaries`, `vui_transfer_characteristics`, `vui_matrix_coeffs` | H.265 colour codes, present only with `colour_description_present_flag` |
+| `vui_video_full_range_flag` | Present only with `video_signal_type_present_flag`; false means limited range |
+| `vui_chroma_sample_loc_type` | The declared 4:2:0 chroma location (0–5); bottom for a field picture with `pic_struct` 2, 10 or 12, otherwise top |
+
+The `vui_*` values are bitstream declarations; the existing `color_*` values
+remain the decoder's report. Missing declarations and values that cannot be
+read from damaged input are `None`, independently for each field; HEVC syntax
+fields are all `None` for other codecs. An unreadable VUI does not stop decoding
+or retain the preceding SPS's declarations. SPS/PPS references and the packet's
+record preserve each picture's values across reordered output and SPS changes.
+
+HEVC upload and reader interlace checks use that picture's `field_seq_flag`
+and `pic_struct`, rather than the decoder report: a true field flag or a
+`pic_struct` of 1–6 or 9–12 is interlaced. Unavailable syntax is left unknown
+and does not inherit an earlier picture's interlace flag. Thus progressive
+pictures remain uploadable after a field sequence. Other codecs retain their
+FFmpeg frame-flag check. CPU `receive_info()` accepts both kinds of picture.
 
 `packet_index` starts at zero when the decoder is created. A `send()` returning
 success or raising `DECODE_FAILED` consumes one number. `AGAIN` (Python `False`)
@@ -358,6 +386,10 @@ Close/destruction abandons unfinished output without writing a trailer;
 explicit close after a successful trailer reports path close failures.
 
 Mux uses the container's built-in framing without adding a bitstream filter.
+MP4 and Matroska accept H.264/HEVC Annex B parameter sets in the stream's
+`configuration` together with `annex_b` packets, including NVENC output with
+in-band parameter-set repetition disabled. The muxer writes the container's
+global configuration and packet framing.
 For `libopenh264` output to MP4 or Matroska, set
 `options=[("flags", "+global_header")]` so the description supplies SPS/PPS.
 For MPEG-TS, leave that flag unset so packets carry in-band SPS/PPS.
