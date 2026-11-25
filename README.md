@@ -23,7 +23,7 @@ Install the Python package from [PyPI](https://pypi.org/project/pixtreme-transpo
 python -m pip install pixtreme-transport-ffmpeg
 ```
 
-The package requires CPython 3.12 or newer and `pixtreme>=2.29.0`. Wheels use the
+The package requires CPython 3.12 or newer and `pixtreme>=2.30.0`. Wheels use the
 CPython stable ABI (`abi3`). Linux x86_64 wheels require glibc 2.28 or newer.
 Check the assets in the [Release for your version](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases)
 for available platforms. Windows x86_64 artifacts are added only for versions
@@ -32,7 +32,7 @@ that have passed native Windows build and runtime checks.
 For C and C++, obtain the SDK archive from the same Release. The SDK contains
 shared libraries, public headers and a CMake package. A Conan 2 recipe named
 `pixtreme-transport-ffmpeg`, which downloads this SDK, is distributed separately
-to the publisher's organisation projects. The pixtreme SDK, version 2.29.0 or newer, is also required. When installing
+to the publisher's organisation projects. The pixtreme SDK, version 2.30.0 or newer, is also required. When installing
 archives manually, make both SDKs discoverable to CMake and their shared
 libraries discoverable to the operating system's library loader.
 
@@ -97,7 +97,26 @@ unknown clock values. `time_base` provides a `Fraction` for valid clocks.
 Stream snapshots
 include `codec`, `kind`, codec `configuration`, time base, video/audio parameters
 and `packet_format` (`length_prefixed`, `annex_b`, `native` or `unknown`). Demux
-preserves these values without filling timestamps or converting bitstreams.
+preserves these values without filling timestamps. By default, it returns the
+original packet bytes and configuration.
+
+Pass `annex_b=True` to either Python constructor to convert every length-prefixed
+H.264/HEVC stream with FFmpeg's `h264_mp4toannexb` / `hevc_mp4toannexb` filter.
+Each returned packet still represents one access unit and retains its stream
+index, PTS, DTS, duration, time base and flags. The stream description pairs the
+filter's Annex B configuration with `packet_format="annex_b"` and
+`nal_length_size=0`. Already Annex B streams and other codecs pass through
+unchanged. Unknown framing or conversion failure raises `ReaderError` with
+`DEMUX_FAILED`. Packets and configuration retain their usual independent
+lifetimes. Seeking resets the filter's state.
+
+C++ uses `DemuxerConfig config; config.annex_b = true;` with
+`Demuxer(path, config)` or `Demuxer(read, seek, config)` (use `{}` for an absent
+seek callback). C uses `pixtreme_transport_ffmpeg_demuxer_config`, initialized
+with `PIXTREME_TRANSPORT_FFMPEG_DEMUXER_CONFIG_INIT`, and
+`demuxer_open_with_config` / `demuxer_open_io_with_config`. Set `annex_b` to a
+nonzero value to request conversion; a null config selects defaults. The
+existing C open functions and C++ constructors keep their original defaults.
 
 For external encoded input, construct `Packet(payload, ...)` and
 `StreamDescription(codec, kind=..., ...)` with the same information instead of
@@ -269,7 +288,7 @@ codec function name stands for `video` or `audio`.
 
 | Operation | C++ header and names | Main C functions (prefix omitted) |
 |---|---|---|
-| Demux and encoded values | `demuxer.hpp`: `Demuxer`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
+| Demux and encoded values | `demuxer.hpp`: `Demuxer`, `DemuxerConfig`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_open_with_config`, `demuxer_open_io_with_config`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
 | Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
 | Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info` |
 | Mux and muxer registry | `muxer.hpp`: `Muxer`, `muxers()` | `muxer_create`, `muxer_create_io`, `muxer_add_stream`, `muxer_write_header`, `muxer_write_packet`, `muxer_write_trailer`, `muxer_count`, `muxer_get_info` |
@@ -443,14 +462,31 @@ samples:
 | HEVC | Main10 4:2:0 and 8-bit 4:4:4, including reordered B pictures |
 | DNxHR | HQX, 10-bit 4:2:2 |
 | VP9, AV1 | 8-bit 4:2:0 |
-| FFV1 | Planar YUV, GBR/GBRA, gray and BGRA samples at representative depths |
+| FFV1 | Planar YUV, including 10/12-bit 4:4:0, GBR/GBRA, gray and BGRA samples at representative depths |
 | PNG | 8-bit RGBA |
-| Raw video | NV12, UYVY, VUYA, RGB0, RGBA, planar GBR, gray and gray-alpha |
+| Raw video | Packed RGB/BGR/RGBA/BGRA, NV12, UYVY/YUYV, VUYA, planar YUV/YUVA and GBR, gray and gray-alpha; little- and big-endian words |
 
-Mapped layout families include planar YUV 4:2:0/4:2:2/4:4:4, YUVA 4:4:4,
-GBR/GBRA, gray/gray-alpha, NV12/NV16, P010/P012/P016/P210/P212/P216, UYVY,
-VUYA, RGBA/BGRA, RGB0/BGR0 and packed 10-bit RGB. Each layout and effective bit
-depth must pass pixtreme's layout validation. The effective depth is the
+The shared reader/decoder/encoder mapping includes these pixtreme layouts:
+
+| pixtreme layout | Effective bit depths mapped from FFmpeg |
+|---|---|
+| `yuv420p`, `yuv422p`, `yuv444p`, `gbrp` | 8, 9, 10, 12, 14, 16 |
+| `yuva444p` | 8, 9, 10, 12, 16 |
+| `gbrap` | 8, 10, 12, 14, 16 |
+| `gray`; `ya` | 8, 9, 10, 12, 14, 16; 8, 16 |
+| `yuv410p`, `yuv411p`; `yuv440p` | 8; 8, 10, 12 |
+| `yuva420p`; `yuva422p` | 8, 9, 10, 16; 8, 9, 10, 12, 16 |
+| `rgb24`, `bgr24`, `argb`, `abgr`, `0rgb`, `0bgr`, `rgba`, `bgra`, `rgb0`, `bgr0`, `uyvy422`, `yuyv422`, `vuya` | 8 |
+| `rgb48`, `bgr48`, `rgba64`, `bgra64` | 16, little-endian words |
+| `gray16be`, `ya16be`, `rgb48be`, `rgba64be`, `gbrp16be`, `gbrap16be` | 16, big-endian words |
+| `nv12`, `nv16`; `p010`, `p210`; `p012`, `p212`; `p016`, `p216` | 8; 10; 12; 16 |
+| `x2rgb10`, `x2bgr10` | 10 |
+
+FFmpeg's `yuvj420p`, `yuvj422p`, `yuvj444p`, `yuvj411p` and `yuvj440p`
+use the corresponding YUV layout and retain the declared full range. Word
+samples use LSB alignment except `p010`, `p012`, `p210` and `p212`, which use
+MSB alignment. Each layout and effective bit depth must pass pixtreme's layout
+validation. The effective depth is the
 decoder's output precision; ProRes alpha is not guaranteed at its full 16-bit
 precision. The distribution's `FFmpeg-configuration.json` lists its actual
 enabled video decoders; that list alone does not establish that a decoded pixel
@@ -459,8 +495,9 @@ format is representable.
 The reader rejects unsupported inputs with a path and reason:
 
 - Interlaced pictures and formats that cannot map directly to PixelBuffer.
-  With pixtreme 2.29.0, examples include 9-bit planar samples, 10-bit GBR/gray,
-  4:1:1/4:4:0, RGB24/RGB48, paletted, floating-point and big-endian samples.
+  With pixtreme 2.30.0, examples include paletted, floating-point, Bayer, XYZ
+  and hardware surface formats, and big-endian layouts without a corresponding
+  pixtreme token.
 - Colour declarations without equivalent pixtreme tokens, including limited
   range or a YCbCr matrix on RGB pictures.
 - Inputs without presentation timestamps, files without video, unavailable
