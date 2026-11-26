@@ -23,7 +23,7 @@ Install the Python package from [PyPI](https://pypi.org/project/pixtreme-transpo
 python -m pip install pixtreme-transport-ffmpeg
 ```
 
-The package requires CPython 3.12 or newer and `pixtreme>=2.31.0`. Wheels use the
+The package requires CPython 3.12 or newer and `pixtreme>=2.31.1`. Wheels use the
 CPython stable ABI (`abi3`). Linux x86_64 wheels require glibc 2.28 or newer.
 Check the assets in the [Release for your version](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases)
 for available platforms. Windows x86_64 artifacts are added only for versions
@@ -32,7 +32,7 @@ that have passed native Windows build and runtime checks.
 For C and C++, obtain the SDK archive from the same Release. The SDK contains
 shared libraries, public headers and a CMake package. A Conan 2 recipe named
 `pixtreme-transport-ffmpeg`, which downloads this SDK, is distributed separately
-to the publisher's organisation projects. The pixtreme SDK, version 2.31.0 or newer, is also required. When installing
+to the publisher's organisation projects. The pixtreme SDK, version 2.31.1 or newer, is also required. When installing
 archives manually, make both SDKs discoverable to CMake and their shared
 libraries discoverable to the operating system's library loader.
 
@@ -118,7 +118,8 @@ are outputs and remain unspecified. The C creation function also accepts the
 original record size through `side_data_count`.
 
 Pass `annex_b=True` to either Python constructor to convert every length-prefixed
-H.264/HEVC stream with FFmpeg's `h264_mp4toannexb` / `hevc_mp4toannexb` filter.
+H.264/HEVC/VVC stream with FFmpeg's `h264_mp4toannexb` / `hevc_mp4toannexb` /
+`vvc_mp4toannexb` filter.
 Each returned packet still represents one access unit and retains its stream
 index, PTS, DTS, duration, time base and flags. The stream description pairs the
 filter's Annex B configuration with `packet_format="annex_b"` and
@@ -394,8 +395,13 @@ global configuration and packet framing.
 For `libopenh264` output to MP4 or Matroska, set
 `options=[("flags", "+global_header")]` so the description supplies SPS/PPS.
 For MPEG-TS, leave that flag unset so packets carry in-band SPS/PPS.
-Length-prefixed H.264/HEVC packets cannot be written directly to MPEG-TS or their
-raw Annex B formats. Keep audio padding side data, but account for container
+Length-prefixed H.264/HEVC/VVC packets cannot be written directly to MPEG-TS or
+their raw Annex B formats (`h264`, `hevc`, `vvc`). VVC Annex B packets can be
+written to MPEG-TS and raw `vvc`; M2TS rejects VVC at header writing. Matroska
+may omit DTS, so the caller must supply known decode times before writing to
+MPEG-TS. DTS equals PTS for this purpose only when pictures have no reordering. Raw VVC
+does not store PTS/DTS, so packets demuxed from raw VVC need caller-supplied
+timestamps before writing to MPEG-TS. Keep audio padding side data, but account for container
 limits: AAC in MPEG-TS has no skip/discard metadata, and MP4 edit offsets may
 round to the movie clock.
 
@@ -624,7 +630,7 @@ format is representable.
 The reader rejects unsupported inputs with a path and reason:
 
 - Interlaced pictures and formats that cannot map directly to PixelBuffer.
-  With pixtreme 2.31.0, examples include paletted, floating-point, Bayer, XYZ
+  With pixtreme 2.31.1, examples include paletted, floating-point, Bayer, XYZ
   and hardware surface formats, and big-endian layouts without a corresponding
   pixtreme token.
 - Colour declarations without equivalent pixtreme tokens, including limited
