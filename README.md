@@ -23,7 +23,7 @@ Install the Python package from [PyPI](https://pypi.org/project/pixtreme-transpo
 python -m pip install pixtreme-transport-ffmpeg
 ```
 
-The package requires CPython 3.12 or newer and `pixtreme>=2.31.1`. Wheels use the
+The package requires CPython 3.12 or newer and `pixtreme>=2.32.0`. Wheels use the
 CPython stable ABI (`abi3`). Linux x86_64 wheels require glibc 2.28 or newer.
 Check the assets in the [Release for your version](https://github.com/sync-dev-org/pixtreme-transport-ffmpeg/releases)
 for available platforms. Windows x86_64 artifacts are added only for versions
@@ -32,7 +32,7 @@ that have passed native Windows build and runtime checks.
 For C and C++, obtain the SDK archive from the same Release. The SDK contains
 shared libraries, public headers and a CMake package. A Conan 2 recipe named
 `pixtreme-transport-ffmpeg`, which downloads this SDK, is distributed separately
-to the publisher's organisation projects. The pixtreme SDK, version 2.31.1 or newer, is also required. When installing
+to the publisher's organisation projects. The pixtreme SDK, version 2.32.0 or newer, is also required. When installing
 archives manually, make both SDKs discoverable to CMake and their shared
 libraries discoverable to the operating system's library loader.
 
@@ -630,7 +630,7 @@ format is representable.
 The reader rejects unsupported inputs with a path and reason:
 
 - Interlaced pictures and formats that cannot map directly to PixelBuffer.
-  With pixtreme 2.31.1, examples include paletted, floating-point, Bayer, XYZ
+  With pixtreme 2.32.0, examples include paletted, floating-point, Bayer, XYZ
   and hardware surface formats, and big-endian layouts without a corresponding
   pixtreme token.
 - Colour declarations without equivalent pixtreme tokens, including limited
