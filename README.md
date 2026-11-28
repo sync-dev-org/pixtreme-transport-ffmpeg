@@ -100,6 +100,48 @@ and `packet_format` (`length_prefixed`, `annex_b`, `native` or `unknown`). Demux
 preserves these values without filling timestamps. By default, it returns the
 original packet bytes and configuration.
 
+Stream descriptions additionally expose optional integer `frame_count`
+(FFmpeg's `nb_frames`), `duration` and `start_time`. Duration and start time use
+the stream's time-base ticks. Demux treats a reported frame count of zero as
+unknown, while a known duration or start time of zero remains zero. Python uses
+`None` for unknown values; C and C++ `info()` pair each value with its own
+`*_known` field. Caller-created descriptions accept these three values and
+their presence, including an explicitly supplied zero frame count. Omitted
+fields and fields outside an older C input record remain unknown.
+
+`demux.container_info` in Python and `demux.container_info()` in C++ return an
+owned `ContainerInfo` snapshot. Its optional `duration` uses microseconds;
+`duration_estimation_method` is `DurationEstimationMethod.FROM_PTS`,
+`FROM_STREAM` or `FROM_BITRATE` in Python (`from_pts`, `from_stream` and
+`from_bitrate` in C++). C uses `demuxer_get_container_info`, a sized
+`pixtreme_transport_ffmpeg_container_info` record with separate known flags,
+and the `PIXTREME_TRANSPORT_FFMPEG_DURATION_FROM_*` constants. Classification
+zero means PTS, and is valid. An unknown container duration also makes its
+classification unknown.
+
+```python
+import pixtreme.transport.ffmpeg as ffmpeg
+
+with ffmpeg.Demuxer("clip.mov") as demux:
+    video = next(s for s in demux.streams if s.kind == "video")
+    container = demux.container_info
+    print(video.frame_count, video.duration, video.start_time, video.time_base)
+    print(container.duration, container.duration_estimation_method)
+# video and container retain these observations after close.
+```
+
+These are FFmpeg's reports at the time of the query, after opening and probing
+with the demuxer's timestamp-preserving settings. They can include FFmpeg's
+estimates and values inferred from other streams or the container. New queries
+may change as input is read; previously returned snapshots remain unchanged.
+The reports do not guarantee the total number of displayed pictures, the last
+picture number, or a mapping from picture numbers to timestamps. An edit list
+can make the reported frame count differ from the displayed count; an audio
+frame count is not a PCM sample count. Container duration can have different
+meanings across formats and IO capabilities. Its classification describes
+FFmpeg's estimation procedure and does not certify each stream's provenance
+or accuracy. This library does not correct or fill these reports.
+
 Stream descriptions also expose `container_color_range`,
 `container_color_primaries`, `container_color_transfer`, `container_color_space`
 and `container_chroma_location` in C, C++ `info()` and Python. These are the
@@ -422,7 +464,7 @@ codec function name stands for `video` or `audio`.
 
 | Operation | C++ header and names | Main C functions (prefix omitted) |
 |---|---|---|
-| Demux and encoded values | `demuxer.hpp`: `Demuxer`, `DemuxerConfig`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_open_with_config`, `demuxer_open_io_with_config`, `demuxer_stream_description`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
+| Demux and encoded values | `demuxer.hpp`: `Demuxer`, `DemuxerConfig`, `ContainerInfo`, `DurationEstimationMethod`, `Packet`, `StreamDescription` | `demuxer_open`, `demuxer_open_io`, `demuxer_open_with_config`, `demuxer_open_io_with_config`, `demuxer_stream_description`, `demuxer_get_container_info`, `demuxer_read`, `demuxer_seek`; `packet_create`, `packet_get_info`, `stream_description_create`, `stream_description_get_info` |
 | Decode and decoder registry | `decoder.hpp`: `VideoDecoder`, `AudioDecoder`, `DecodedPicture`, `Audio`, `DecodeStatus`, `decoders()` | `*_decoder_create`, `*_decoder_send`, `*_decoder_receive`, `video_decoder_receive_info`, `*_decoder_drain`, `*_decoder_flush`, `audio_get_info`, `decoder_count`, `decoder_get_info` |
 | Encode and encoder registry | `encoder.hpp`: `VideoEncoder`, `AudioEncoder`, `EncodeStatus`, `encoders()`, `default_encoder(kind)`, `default_pixel_format(codec)` | `*_encoder_create`, `*_encoder_send`, `*_encoder_receive`, `*_encoder_drain`, `*_encoder_stream_description`, `encoder_count`, `encoder_get_info`, `default_encoder`, `default_pixel_format` |
 | Mux and muxer registry | `muxer.hpp`: `Muxer`, `muxers()` | `muxer_create`, `muxer_create_io`, `muxer_add_stream`, `muxer_write_header`, `muxer_write_packet`, `muxer_write_trailer`, `muxer_count`, `muxer_get_info` |
